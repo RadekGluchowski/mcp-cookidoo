@@ -6,7 +6,9 @@ Module to encapsulate all cookidoo-api logic for interacting with the Cookidoo p
 
 import asyncio
 import os
+import re
 from dataclasses import dataclass
+from datetime import date
 
 from aiohttp import ClientSession
 from cookidoo_api import (
@@ -25,10 +27,43 @@ from cookidoo_api.helpers import (
     cookidoo_search_result_from_json,
     get_localization_options,
 )
+from cookidoo_api.types import (
+    CookidooAdditionalItem,
+    CookidooCalendarDay,
+    CookidooCollection,
+    CookidooIngredientItem,
+    CookidooShoppingRecipe,
+)
 from dotenv import load_dotenv
 
 from guided import to_instruction
 from schemas import CustomRecipe
+
+_CATALOGUE_ID = re.compile(r"r\d+")
+
+
+def is_catalogue_recipe(recipe_id: str) -> bool:
+    """Catalogue recipe IDs look like "r59322"; custom recipe IDs do not."""
+    return _CATALOGUE_ID.fullmatch(recipe_id) is not None
+
+
+def split_recipe_ids(recipe_ids: list[str]) -> tuple[list[str], list[str]]:
+    """(catalogue IDs, custom IDs), each in the given order."""
+    catalogue = [r for r in recipe_ids if is_catalogue_recipe(r)]
+    return catalogue, [r for r in recipe_ids if not is_catalogue_recipe(r)]
+
+
+@dataclass
+class ShoppingList:
+    recipes: list[CookidooShoppingRecipe]
+    ingredients: list[CookidooIngredientItem]
+    additional_items: list[CookidooAdditionalItem]
+
+
+@dataclass
+class Collections:
+    custom: list[CookidooCollection]
+    managed: list[CookidooCollection]
 
 
 @dataclass(frozen=True)
@@ -240,6 +275,159 @@ class CookidooService:
                 hints=recipe.hints or [],
             ),
         )
+
+    async def get_meal_plan_week(self, day: date) -> list[CookidooCalendarDay]:
+        """The "My Week" planner days of the calendar week containing `day`."""
+        api = await self.client()
+        return await api.get_recipes_in_calendar_week(day)
+
+    async def _meal_plan_day(self, api: Cookidoo, day: date) -> CookidooCalendarDay:
+        # Day responses list custom recipes by ID only; the week endpoint resolves their names.
+        week = await api.get_recipes_in_calendar_week(day)
+        return next(
+            (d for d in week if d.id == day.isoformat()),
+            CookidooCalendarDay(id=day.isoformat(), title=day.isoformat(), recipes=[]),
+        )
+
+    async def add_to_meal_plan(self, day: date, recipe_ids: list[str]) -> CookidooCalendarDay:
+        """Plan catalogue and/or custom recipes on a day; each kind has its own endpoint."""
+        api = await self.client()
+        catalogue, custom = split_recipe_ids(recipe_ids)
+        if catalogue:
+            await api.add_recipes_to_calendar(day, catalogue)
+        if custom:
+            await api.add_custom_recipes_to_calendar(day, custom)
+        return await self._meal_plan_day(api, day)
+
+    async def remove_from_meal_plan(self, day: date, recipe_id: str) -> CookidooCalendarDay:
+        """Remove one recipe (catalogue or custom) from a day of the planner."""
+        api = await self.client()
+        if is_catalogue_recipe(recipe_id):
+            await api.remove_recipe_from_calendar(day, recipe_id)
+        else:
+            await api.remove_custom_recipe_from_calendar(day, recipe_id)
+        return await self._meal_plan_day(api, day)
+
+    async def copy_recipe_to_custom(self, recipe_id: str, servings: int) -> CookidooCustomRecipe:
+        """Copy a catalogue recipe into the user's custom recipes."""
+        api = await self.client()
+        return await api.add_custom_recipe_from(recipe_id, servings)
+
+    async def delete_custom_recipe(self, recipe_id: str) -> None:
+        api = await self.client()
+        await api.remove_custom_recipe(recipe_id)
+
+    # Shopping list
+
+    async def get_shopping_list(self) -> ShoppingList:
+        api = await self.client()
+        recipes, ingredients, additional = await asyncio.gather(
+            api.get_shopping_list_recipes(),
+            api.get_ingredient_items(),
+            api.get_additional_items(),
+        )
+        return ShoppingList(recipes, ingredients, additional)
+
+    async def add_recipes_to_shopping_list(self, recipe_ids: list[str]) -> None:
+        api = await self.client()
+        catalogue, custom = split_recipe_ids(recipe_ids)
+        if catalogue:
+            await api.add_ingredient_items_for_recipes(catalogue)
+        if custom:
+            await api.add_ingredient_items_for_custom_recipes(custom)
+
+    async def remove_recipes_from_shopping_list(self, recipe_ids: list[str]) -> None:
+        api = await self.client()
+        catalogue, custom = split_recipe_ids(recipe_ids)
+        if catalogue:
+            await api.remove_ingredient_items_for_recipes(catalogue)
+        if custom:
+            await api.remove_ingredient_items_for_custom_recipes(custom)
+
+    async def add_meal_plan_to_shopping_list(self, day: date) -> list[str]:
+        """Add every recipe planned in the week containing `day`; returns their names."""
+        week = await self.get_meal_plan_week(day)
+        recipes = {r.id: r.name for d in week for r in d.recipes}
+        if recipes:
+            await self.add_recipes_to_shopping_list(list(recipes))
+        return list(recipes.values())
+
+    async def add_shopping_list_items(self, names: list[str]) -> list[CookidooAdditionalItem]:
+        api = await self.client()
+        return await api.add_additional_items(names)
+
+    async def remove_shopping_list_items(self, item_ids: list[str]) -> None:
+        api = await self.client()
+        await api.remove_additional_items(item_ids)
+
+    async def mark_shopping_list_items(self, item_ids: list[str], owned: bool) -> list[str]:
+        """
+        Tick (owned=True) or untick ingredient and additional items; returns the IDs that
+        are not on the list. Each kind has its own ownership endpoint.
+        """
+        api = await self.client()
+        current = await self.get_shopping_list()
+        wanted = set(item_ids)
+        ingredients = [i for i in current.ingredients if i.id in wanted]
+        additional = [i for i in current.additional_items if i.id in wanted]
+        for item in (*ingredients, *additional):
+            item.is_owned = owned
+        if ingredients:
+            await api.edit_ingredient_items_ownership(ingredients)
+        if additional:
+            await api.edit_additional_items_ownership(additional)
+        found = {i.id for i in (*ingredients, *additional)}
+        return [i for i in item_ids if i not in found]
+
+    async def clear_shopping_list(self) -> None:
+        api = await self.client()
+        await api.clear_shopping_list()
+
+    # Collections
+
+    async def list_collections(self) -> Collections:
+        api = await self.client()
+
+        async def all_pages(count, get) -> list[CookidooCollection]:
+            _, pages = await count()
+            result: list[CookidooCollection] = []
+            for page in range(pages):
+                result += await get(page)
+            return result
+
+        custom, managed = await asyncio.gather(
+            all_pages(api.count_custom_collections, api.get_custom_collections),
+            all_pages(api.count_managed_collections, api.get_managed_collections),
+        )
+        return Collections(custom, managed)
+
+    async def create_collection(self, name: str) -> CookidooCollection:
+        api = await self.client()
+        return await api.add_custom_collection(name)
+
+    async def delete_collection(self, collection_id: str) -> None:
+        api = await self.client()
+        await api.remove_custom_collection(collection_id)
+
+    async def add_recipes_to_collection(
+        self, collection_id: str, recipe_ids: list[str]
+    ) -> CookidooCollection:
+        api = await self.client()
+        return await api.add_recipes_to_custom_collection(collection_id, recipe_ids)
+
+    async def remove_recipe_from_collection(
+        self, collection_id: str, recipe_id: str
+    ) -> CookidooCollection:
+        api = await self.client()
+        return await api.remove_recipe_from_custom_collection(collection_id, recipe_id)
+
+    async def follow_collection(self, collection_id: str) -> CookidooCollection:
+        api = await self.client()
+        return await api.add_managed_collection(collection_id)
+
+    async def unfollow_collection(self, collection_id: str) -> None:
+        api = await self.client()
+        await api.remove_managed_collection(collection_id)
 
     @property
     def localization_url(self) -> str | None:

@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- "My Week" meal planner: `get_meal_plan` shows a calendar week, `add_to_meal_plan` plans
+  catalogue and custom recipes (mixed freely) on a day, `remove_from_meal_plan` removes one.
+  Custom recipes are listed by name, not only by ID
+- Shopping list: `get_shopping_list`, `add_recipes_to_shopping_list` / `remove_recipes_from_shopping_list`
+  (catalogue and custom recipes), `add_meal_plan_to_shopping_list` (a whole planned week),
+  `add_shopping_list_items` / `remove_shopping_list_items` (free-text items),
+  `mark_shopping_list_items` (tick off / untick) and `clear_shopping_list`
+- `copy_recipe_to_custom`: copy a catalogue recipe into your custom recipes; `delete_custom_recipe`
+- Collections: `list_collections`, `create_collection`, `delete_collection`,
+  `add_recipes_to_collection`, `remove_recipe_from_collection`, `follow_collection`,
+  `unfollow_collection`
+
+### Fixed
+- Meal planner tools no longer fail with `unsupported operand type(s) for /: 'str' and 'int'`:
+  the calendar API returns recipe times as strings (e.g. `"2400.0"`)
+
 ## [1.1.0] - 2026-10-20
 
 ### Added

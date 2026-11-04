@@ -9,13 +9,14 @@ import re
 import tomllib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import date
 from pathlib import Path
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import ValidationError
 
-from cookidoo_service import CookidooService, load_cookidoo_settings
+from cookidoo_service import CookidooService, is_catalogue_recipe, load_cookidoo_settings
 from guided import from_raw
 from schemas import CustomRecipe, Step
 
@@ -41,9 +42,11 @@ mcp = FastMCP(
     "cookidoo-mcp-server",
     version=VERSION,
     instructions=(
-        "Tools for the Thermomix Cookidoo platform: search recipes, read them, and create "
-        "or edit the user's own custom recipes. Always show a recipe to the user and get "
-        "explicit approval before creating or updating it."
+        "Tools for the Thermomix Cookidoo platform: search recipes, read them, create, "
+        "copy, edit or delete the user's own custom recipes, plan recipes in the "
+        '"My Week" meal planner, manage the shopping list and recipe collections. '
+        "Always show a recipe to the user and get explicit approval before creating or "
+        "updating it, and before deleting anything or clearing the shopping list."
     ),
     lifespan=lifespan,
 )
@@ -83,6 +86,14 @@ def _split_list(text: str) -> list[str]:
     return [part.strip() for part in parts if part.strip()]
 
 
+def _ids(value: list[str] | str, what: str = "recipe ID") -> list[str]:
+    items = value if isinstance(value, list) else _split_list(value)
+    items = [i.strip() for i in items if i.strip()]
+    if not items:
+        raise ToolError(f"Provide at least one {what}.")
+    return items
+
+
 def _parse_recipe_json(recipe_json: str) -> CustomRecipe:
     try:
         return CustomRecipe.model_validate_json(recipe_json)
@@ -90,8 +101,31 @@ def _parse_recipe_json(recipe_json: str) -> CustomRecipe:
         raise ToolError(f"Invalid recipe data: {e}") from e
 
 
-def _minutes(seconds: int | None) -> str:
-    return f"{round(seconds / 60)} min" if seconds else "?"
+def _day(value: str) -> date:
+    if not value:
+        return date.today()
+    try:
+        return date.fromisoformat(value)
+    except ValueError as e:
+        raise ToolError(f"Invalid date '{value}', expected YYYY-MM-DD.") from e
+
+
+def _format_day(day) -> str:
+    lines = [f"{day.id}:"]
+    lines += [
+        f"- {r.name}{' (custom)' if r.is_custom else ''} ({_minutes(r.total_time)})\n"
+        f"  ID: {r.id} | {r.url}"
+        for r in day.recipes
+    ]
+    return "\n".join(lines) if day.recipes else f"{day.id}: nothing planned"
+
+
+def _minutes(seconds: int | float | str | None) -> str:
+    # The calendar API returns times as strings ("2400.0"); catalogue recipes as numbers.
+    try:
+        return f"{round(float(seconds) / 60)} min" if seconds else "?"
+    except (TypeError, ValueError):
+        return "?"
 
 
 def _strip_markup(text: str) -> str:
@@ -325,6 +359,394 @@ async def update_custom_recipe(recipe_id: str, recipe_json: str) -> str:
     except Exception as e:
         raise ToolError(f"Update failed: {e}") from e
     return f"Recipe '{updated.name}' updated.\nRecipe ID: {updated.id}\nURL: {updated.url}"
+
+
+@mcp.tool(annotations=WRITE)
+async def copy_recipe_to_custom(recipe_id: str, servings: int | None = None) -> str:
+    """
+    Copy a Cookidoo catalogue recipe into the user's custom recipes, as a starting point
+    for their own version (then edit it with get_custom_recipe / update_custom_recipe).
+
+    Args:
+        recipe_id: The catalogue recipe ID (e.g. "r59322")
+        servings: Number of servings of the copy (default: the original's)
+    """
+    if not is_catalogue_recipe(recipe_id):
+        raise ToolError("Only catalogue recipes (IDs like 'r59322') can be copied.")
+    service = _get_service()
+    try:
+        if servings is None:
+            details = await service.get_recipe_details(recipe_id)
+            servings = details.serving_size
+        created = await service.copy_recipe_to_custom(recipe_id, servings)
+    except Exception as e:
+        raise ToolError(f"Copy failed: {e}") from e
+    return (
+        f"Recipe '{created.name}' copied to your recipes.\n"
+        f"Recipe ID: {created.id}\nURL: {created.url}"
+    )
+
+
+@mcp.tool(annotations={**WRITE, "destructiveHint": True, "idempotentHint": True})
+async def delete_custom_recipe(recipe_id: str) -> str:
+    """
+    Permanently delete one of the user's custom recipes. This cannot be undone.
+
+    Show the user which recipe will be deleted and only call this after their explicit
+    approval.
+
+    Args:
+        recipe_id: The custom recipe ID returned by list_custom_recipes
+    """
+    try:
+        await _get_service().delete_custom_recipe(recipe_id)
+    except Exception as e:
+        raise ToolError(f"Delete failed: {e}") from e
+    return f"Custom recipe {recipe_id} deleted."
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_shopping_list() -> str:
+    """
+    Show the Cookidoo shopping list: its recipes, the ingredients still to buy or already
+    ticked off, and the additional (free-text) items, with the IDs other tools take.
+    """
+    try:
+        sl = await _get_service().get_shopping_list()
+    except Exception as e:
+        raise ToolError(f"Failed to load the shopping list: {e}") from e
+    if not (sl.recipes or sl.ingredients or sl.additional_items):
+        return "The shopping list is empty."
+
+    def item(i) -> str:
+        detail = f" {i.description}" if getattr(i, "description", "") else ""
+        return f"- [{'x' if i.is_owned else ' '}] {i.name}{detail} (ID: {i.id})"
+
+    sections = []
+    if sl.recipes:
+        sections.append("Recipes:\n" + "\n".join(f"- {r.name} (ID: {r.id})" for r in sl.recipes))
+    if sl.ingredients:
+        sections.append("Ingredients:\n" + "\n".join(map(item, sl.ingredients)))
+    if sl.additional_items:
+        sections.append("Additional items:\n" + "\n".join(map(item, sl.additional_items)))
+    return "\n\n".join(sections)
+
+
+@mcp.tool(annotations=WRITE)
+async def add_recipes_to_shopping_list(recipe_ids: list[str] | str) -> str:
+    """
+    Add the ingredients of recipes to the Cookidoo shopping list. Accepts catalogue and
+    custom recipe IDs, mixed freely.
+
+    Args:
+        recipe_ids: Recipe IDs, as a list (or comma-separated)
+    """
+    ids = _ids(recipe_ids)
+    try:
+        await _get_service().add_recipes_to_shopping_list(ids)
+    except Exception as e:
+        raise ToolError(f"Failed to add to the shopping list: {e}") from e
+    return f"Added the ingredients of {len(ids)} recipe(s) to the shopping list."
+
+
+@mcp.tool(annotations={**WRITE, "destructiveHint": True, "idempotentHint": True})
+async def remove_recipes_from_shopping_list(recipe_ids: list[str] | str) -> str:
+    """
+    Remove recipes, and their ingredients, from the Cookidoo shopping list.
+
+    Args:
+        recipe_ids: Recipe IDs as shown by get_shopping_list, as a list (or comma-separated)
+    """
+    ids = _ids(recipe_ids)
+    try:
+        await _get_service().remove_recipes_from_shopping_list(ids)
+    except Exception as e:
+        raise ToolError(f"Failed to remove from the shopping list: {e}") from e
+    return f"Removed {len(ids)} recipe(s) from the shopping list."
+
+
+@mcp.tool(annotations=WRITE)
+async def add_meal_plan_to_shopping_list(day: str = "") -> str:
+    """
+    Add the ingredients of every recipe planned in a "My Week" calendar week to the
+    Cookidoo shopping list.
+
+    Args:
+        day: Any day of the week, as YYYY-MM-DD (default: today)
+    """
+    target = _day(day)
+    try:
+        names = await _get_service().add_meal_plan_to_shopping_list(target)
+    except Exception as e:
+        raise ToolError(f"Failed to add the meal plan to the shopping list: {e}") from e
+    if not names:
+        return "Nothing planned that week; the shopping list is unchanged."
+    return "Added to the shopping list:\n" + "\n".join(f"- {n}" for n in names)
+
+
+@mcp.tool(annotations=WRITE)
+async def add_shopping_list_items(items: list[str] | str) -> str:
+    """
+    Add free-text items (not tied to a recipe, e.g. "kitchen paper") to the shopping list.
+
+    Args:
+        items: Item names, as a list (or one per line / comma-separated)
+    """
+    names = _ids(items, "item")
+    try:
+        added = await _get_service().add_shopping_list_items(names)
+    except Exception as e:
+        raise ToolError(f"Failed to add items: {e}") from e
+    return "Added:\n" + "\n".join(f"- {i.name} (ID: {i.id})" for i in added)
+
+
+@mcp.tool(annotations={**WRITE, "destructiveHint": True, "idempotentHint": True})
+async def remove_shopping_list_items(item_ids: list[str] | str) -> str:
+    """
+    Remove additional (free-text) items from the shopping list. Recipe ingredients are
+    removed with remove_recipes_from_shopping_list instead.
+
+    Args:
+        item_ids: Additional item IDs as shown by get_shopping_list
+    """
+    ids = _ids(item_ids, "item ID")
+    try:
+        await _get_service().remove_shopping_list_items(ids)
+    except Exception as e:
+        raise ToolError(f"Failed to remove items: {e}") from e
+    return f"Removed {len(ids)} item(s)."
+
+
+@mcp.tool(annotations={**WRITE, "idempotentHint": True})
+async def mark_shopping_list_items(item_ids: list[str] | str, owned: bool = True) -> str:
+    """
+    Tick shopping list items off as already owned / bought (or untick them with
+    owned=false). Works for both ingredients and additional items.
+
+    Args:
+        item_ids: Item IDs as shown by get_shopping_list
+        owned: True to tick off, False to put back on the list
+    """
+    ids = _ids(item_ids, "item ID")
+    try:
+        missing = await _get_service().mark_shopping_list_items(ids, owned)
+    except Exception as e:
+        raise ToolError(f"Failed to update items: {e}") from e
+    done = len(ids) - len(missing)
+    text = f"{'Ticked off' if owned else 'Unticked'} {done} item(s)."
+    if missing:
+        text += f"\nNot on the shopping list: {', '.join(missing)}"
+    return text
+
+
+@mcp.tool(annotations={**WRITE, "destructiveHint": True, "idempotentHint": True})
+async def clear_shopping_list() -> str:
+    """
+    Empty the whole shopping list: recipes, ingredients and additional items.
+
+    Only call this after the user explicitly asked for it.
+    """
+    try:
+        await _get_service().clear_shopping_list()
+    except Exception as e:
+        raise ToolError(f"Failed to clear the shopping list: {e}") from e
+    return "The shopping list is now empty."
+
+
+def _format_collection(c) -> str:
+    recipes = [r for chapter in c.chapters for r in chapter.recipes]
+    lines = [f"{c.name} ({len(recipes)} recipes) | ID: {c.id}"]
+    lines += [f"  - {r.name} ({_minutes(r.total_time)}) | ID: {r.id}" for r in recipes]
+    return "\n".join(lines)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def list_collections() -> str:
+    """
+    List the user's own recipe collections and the Cookidoo collections they follow,
+    with their recipes.
+    """
+    try:
+        cols = await _get_service().list_collections()
+    except Exception as e:
+        raise ToolError(f"Failed to list collections: {e}") from e
+    sections = [
+        "My collections:\n" + ("\n".join(map(_format_collection, cols.custom)) or "(none)"),
+        "Followed Cookidoo collections:\n"
+        + ("\n".join(map(_format_collection, cols.managed)) or "(none)"),
+    ]
+    return "\n\n".join(sections)
+
+
+@mcp.tool(annotations=WRITE)
+async def create_collection(name: str, recipe_ids: list[str] | str = "") -> str:
+    """
+    Create a new collection of the user's, optionally filled with catalogue recipes.
+
+    Args:
+        name: The collection name
+        recipe_ids: Optional catalogue recipe IDs to put in it
+    """
+    ids = _catalogue_ids(recipe_ids) if recipe_ids else []
+    service = _get_service()
+    try:
+        collection = await service.create_collection(name)
+        if ids:
+            collection = await service.add_recipes_to_collection(collection.id, ids)
+    except Exception as e:
+        raise ToolError(f"Failed to create the collection: {e}") from e
+    return "Collection created.\n" + _format_collection(collection)
+
+
+@mcp.tool(annotations={**WRITE, "destructiveHint": True, "idempotentHint": True})
+async def delete_collection(collection_id: str) -> str:
+    """
+    Delete one of the user's own collections (the recipes themselves are kept).
+
+    Only call this after the user's explicit approval.
+
+    Args:
+        collection_id: The collection ID from list_collections ("My collections")
+    """
+    try:
+        await _get_service().delete_collection(collection_id)
+    except Exception as e:
+        raise ToolError(f"Failed to delete the collection: {e}") from e
+    return f"Collection {collection_id} deleted."
+
+
+def _catalogue_ids(recipe_ids: list[str] | str) -> list[str]:
+    ids = _ids(recipe_ids)
+    custom = [i for i in ids if not is_catalogue_recipe(i)]
+    if custom:
+        raise ToolError(
+            "Collections only hold catalogue recipes (IDs like 'r59322'); "
+            f"not allowed: {', '.join(custom)}"
+        )
+    return ids
+
+
+@mcp.tool(annotations={**WRITE, "idempotentHint": True})
+async def add_recipes_to_collection(collection_id: str, recipe_ids: list[str] | str) -> str:
+    """
+    Add catalogue recipes to one of the user's own collections.
+
+    Args:
+        collection_id: The collection ID from list_collections ("My collections")
+        recipe_ids: Catalogue recipe IDs, as a list (or comma-separated)
+    """
+    ids = _catalogue_ids(recipe_ids)
+    try:
+        collection = await _get_service().add_recipes_to_collection(collection_id, ids)
+    except Exception as e:
+        raise ToolError(f"Failed to add to the collection: {e}") from e
+    return _format_collection(collection)
+
+
+@mcp.tool(annotations={**WRITE, "destructiveHint": True, "idempotentHint": True})
+async def remove_recipe_from_collection(collection_id: str, recipe_id: str) -> str:
+    """
+    Remove a recipe from one of the user's own collections.
+
+    Args:
+        collection_id: The collection ID from list_collections ("My collections")
+        recipe_id: The recipe ID to remove
+    """
+    try:
+        collection = await _get_service().remove_recipe_from_collection(collection_id, recipe_id)
+    except Exception as e:
+        raise ToolError(f"Failed to remove from the collection: {e}") from e
+    return _format_collection(collection)
+
+
+@mcp.tool(annotations={**WRITE, "idempotentHint": True})
+async def follow_collection(collection_id: str) -> str:
+    """
+    Follow (save) a Cookidoo editorial collection. Its ID is the last part of the
+    collection's URL on cookidoo, e.g. "col123456".
+
+    Args:
+        collection_id: The Cookidoo collection ID
+    """
+    try:
+        collection = await _get_service().follow_collection(collection_id)
+    except Exception as e:
+        raise ToolError(f"Failed to follow the collection: {e}") from e
+    return "Now following:\n" + _format_collection(collection)
+
+
+@mcp.tool(annotations={**WRITE, "destructiveHint": True, "idempotentHint": True})
+async def unfollow_collection(collection_id: str) -> str:
+    """
+    Stop following a Cookidoo editorial collection.
+
+    Args:
+        collection_id: The collection ID from list_collections ("Followed Cookidoo collections")
+    """
+    try:
+        await _get_service().unfollow_collection(collection_id)
+    except Exception as e:
+        raise ToolError(f"Failed to unfollow the collection: {e}") from e
+    return f"No longer following collection {collection_id}."
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_meal_plan(day: str = "") -> str:
+    """
+    Show the recipes planned in the Cookidoo "My Week" planner for the calendar week
+    containing a day.
+
+    Args:
+        day: Any day of the week to show, as YYYY-MM-DD (default: today)
+    """
+    target = _day(day)
+    try:
+        week = await _get_service().get_meal_plan_week(target)
+    except Exception as e:
+        raise ToolError(f"Failed to load the meal plan: {e}") from e
+
+    planned = [d for d in week if d.recipes]
+    if not planned:
+        return "Nothing planned this week."
+    return "\n\n".join(_format_day(d) for d in planned)
+
+
+@mcp.tool(annotations=WRITE)
+async def add_to_meal_plan(day: str, recipe_ids: list[str] | str) -> str:
+    """
+    Plan recipes on a day of the Cookidoo "My Week" planner.
+
+    Accepts catalogue recipe IDs (from search_recipes, e.g. "r59322") and custom recipe
+    IDs (from list_custom_recipes), mixed freely.
+
+    Args:
+        day: The day to plan the recipes on, as YYYY-MM-DD
+        recipe_ids: Recipe IDs, as a list (or comma-separated)
+    """
+    ids = _ids(recipe_ids)
+    target = _day(day)
+    try:
+        planned = await _get_service().add_to_meal_plan(target, ids)
+    except Exception as e:
+        raise ToolError(f"Failed to add to the meal plan: {e}") from e
+    return f"Added {len(ids)} recipe(s).\n\n{_format_day(planned)}"
+
+
+@mcp.tool(annotations={**WRITE, "destructiveHint": True, "idempotentHint": True})
+async def remove_from_meal_plan(day: str, recipe_id: str) -> str:
+    """
+    Remove a recipe from a day of the Cookidoo "My Week" planner.
+
+    Args:
+        day: The day the recipe is planned on, as YYYY-MM-DD
+        recipe_id: The catalogue or custom recipe ID, as shown by get_meal_plan
+    """
+    target = _day(day)
+    try:
+        planned = await _get_service().remove_from_meal_plan(target, recipe_id.strip())
+    except Exception as e:
+        raise ToolError(f"Failed to remove from the meal plan: {e}") from e
+    return f"Removed {recipe_id}.\n\n{_format_day(planned)}"
 
 
 @mcp.prompt

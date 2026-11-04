@@ -8,7 +8,10 @@ An MCP (Model Context Protocol) server for interacting with the Thermomix Cookid
 
 - **Recipe Search**: Find recipes by keywords and/or ingredients, with a maximum total time
 - **Recipe Details**: Fetch ingredients, steps and times of any Cookidoo recipe
-- **Custom Recipes**: List, read, create and update the recipes on your own account
+- **Custom Recipes**: List, read, create, update and delete the recipes on your own account, or copy a catalogue recipe as a starting point
+- **Meal Planner**: View the "My Week" planner and add or remove catalogue and custom recipes on any day
+- **Shopping List**: Add recipes (or a whole planned week), free-text items, tick items off, clear the list
+- **Collections**: Create your own collections and fill them, follow Cookidoo's collections
 - **Guided Cooking**: Steps can carry Thermomix settings (time, temperature, speed, reverse), preset on the machine
 - **Guided Prompt**: `create_thermomix_recipe` walks the assistant through writing a proper Thermomix recipe (EN / FR)
 
@@ -92,6 +95,25 @@ uv run fastmcp dev inspector fastmcp.json           # MCP Inspector
 | `generate_recipe_structure` | Validate a new recipe and return its JSON |
 | `upload_custom_recipe` | Create a custom recipe from that JSON |
 | `update_custom_recipe` | Replace an existing custom recipe with that JSON |
+| `get_meal_plan` | Show the recipes planned in the "My Week" planner for a week |
+| `add_to_meal_plan` | Plan catalogue and/or custom recipes on a day |
+| `remove_from_meal_plan` | Remove a recipe from a day of the planner |
+| `copy_recipe_to_custom` | Copy a catalogue recipe into your custom recipes |
+| `delete_custom_recipe` | Permanently delete a custom recipe |
+| `get_shopping_list` | Show the shopping list: recipes, ingredients, additional items |
+| `add_recipes_to_shopping_list` | Add the ingredients of catalogue and/or custom recipes |
+| `remove_recipes_from_shopping_list` | Remove recipes and their ingredients |
+| `add_meal_plan_to_shopping_list` | Add every recipe planned in a week |
+| `add_shopping_list_items` | Add free-text items |
+| `remove_shopping_list_items` | Remove free-text items |
+| `mark_shopping_list_items` | Tick items off as owned / bought, or untick them |
+| `clear_shopping_list` | Empty the whole shopping list |
+| `list_collections` | List your collections and the Cookidoo collections you follow |
+| `create_collection` | Create a collection, optionally with recipes |
+| `delete_collection` | Delete one of your collections |
+| `add_recipes_to_collection` | Add catalogue recipes to one of your collections |
+| `remove_recipe_from_collection` | Remove a recipe from one of your collections |
+| `follow_collection` / `unfollow_collection` | Follow or unfollow a Cookidoo collection |
 
 ## Recipe steps
 

@@ -1,4 +1,5 @@
 import json
+from datetime import date
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -35,6 +36,26 @@ def service(monkeypatch):
         "get_custom_recipe",
         "create_custom_recipe",
         "update_custom_recipe",
+        "get_meal_plan_week",
+        "add_to_meal_plan",
+        "remove_from_meal_plan",
+        "copy_recipe_to_custom",
+        "delete_custom_recipe",
+        "get_shopping_list",
+        "add_recipes_to_shopping_list",
+        "remove_recipes_from_shopping_list",
+        "add_meal_plan_to_shopping_list",
+        "add_shopping_list_items",
+        "remove_shopping_list_items",
+        "mark_shopping_list_items",
+        "clear_shopping_list",
+        "list_collections",
+        "create_collection",
+        "delete_collection",
+        "add_recipes_to_collection",
+        "remove_recipe_from_collection",
+        "follow_collection",
+        "unfollow_collection",
     ):
         monkeypatch.setattr(svc, name, AsyncMock())
     monkeypatch.setattr(server, "_cookidoo_service", svc)
@@ -60,6 +81,26 @@ async def test_all_tools_registered():
         "generate_recipe_structure",
         "upload_custom_recipe",
         "update_custom_recipe",
+        "get_meal_plan",
+        "add_to_meal_plan",
+        "remove_from_meal_plan",
+        "copy_recipe_to_custom",
+        "delete_custom_recipe",
+        "get_shopping_list",
+        "add_recipes_to_shopping_list",
+        "remove_recipes_from_shopping_list",
+        "add_meal_plan_to_shopping_list",
+        "add_shopping_list_items",
+        "remove_shopping_list_items",
+        "mark_shopping_list_items",
+        "clear_shopping_list",
+        "list_collections",
+        "create_collection",
+        "delete_collection",
+        "add_recipes_to_collection",
+        "remove_recipe_from_collection",
+        "follow_collection",
+        "unfollow_collection",
     }
     assert prompts == {"create_thermomix_recipe"}
 
@@ -300,3 +341,197 @@ def test_settings_from_env(monkeypatch):
     monkeypatch.delenv("COOKIDOO_PASSWORD")
     with pytest.raises(ValueError, match="Missing"):
         load_cookidoo_settings()
+
+
+def _day(day_id, *recipes):
+    return SimpleNamespace(id=day_id, title=day_id, recipes=list(recipes))
+
+
+def _planned(recipe_id, name, custom=False):
+    return SimpleNamespace(
+        id=recipe_id, name=name, total_time=1800, is_custom=custom, url=f"https://x/{recipe_id}"
+    )
+
+
+async def test_get_meal_plan_lists_planned_days(service):
+    service.get_meal_plan_week.return_value = [
+        _day("2026-11-02"),
+        _day("2026-11-03", _planned("r1", "Gratin"), _planned("01ABC", "Cookies", custom=True)),
+    ]
+    text = await call("get_meal_plan", day="2026-11-04")
+    service.get_meal_plan_week.assert_awaited_once_with(date(2026, 11, 4))
+    assert "2026-11-02" not in text
+    assert "2026-11-03:" in text and "Gratin" in text and "Cookies (custom)" in text
+
+
+async def test_get_meal_plan_accepts_string_times(service):
+    # The live calendar API returns total_time as a string such as "2400.0".
+    recipe = _planned("r56899", "Leczo")
+    recipe.total_time = "2400.0"
+    broken = _planned("r1", "Gratin")
+    broken.total_time = "n/a"
+    service.get_meal_plan_week.return_value = [_day("2026-11-05", recipe, broken)]
+    text = await call("get_meal_plan", day="2026-11-05")
+    assert "Leczo (40 min)" in text
+    assert "Gratin (?)" in text
+
+
+async def test_get_meal_plan_empty_week(service):
+    service.get_meal_plan_week.return_value = [_day("2026-11-02")]
+    assert await call("get_meal_plan") == "Nothing planned this week."
+    service.get_meal_plan_week.assert_awaited_once_with(date.today())
+
+
+async def test_get_meal_plan_rejects_bad_date(service):
+    with pytest.raises(ToolError, match="YYYY-MM-DD"):
+        await call("get_meal_plan", day="next friday")
+
+
+async def test_add_to_meal_plan_accepts_comma_separated_ids(service):
+    service.add_to_meal_plan.return_value = _day("2026-11-05", _planned("r1", "Gratin"))
+    text = await call("add_to_meal_plan", day="2026-11-05", recipe_ids="r1, 01ABC")
+    service.add_to_meal_plan.assert_awaited_once_with(date(2026, 11, 5), ["r1", "01ABC"])
+    assert "Added 2 recipe(s)" in text and "Gratin" in text
+
+
+async def test_remove_from_meal_plan_reports_empty_day(service):
+    service.remove_from_meal_plan.return_value = _day("2026-11-05")
+    text = await call("remove_from_meal_plan", day="2026-11-05", recipe_id="r1")
+    service.remove_from_meal_plan.assert_awaited_once_with(date(2026, 11, 5), "r1")
+    assert "nothing planned" in text
+
+
+async def test_service_routes_catalogue_and_custom_ids(monkeypatch):
+    svc = CookidooService(CookidooSettings(email="a@b.c", password="x"))
+    api = AsyncMock()
+    api.get_recipes_in_calendar_week.return_value = [_day("2026-11-04"), _day("2026-11-05")]
+    monkeypatch.setattr(svc, "client", AsyncMock(return_value=api))
+    day = date(2026, 11, 5)
+
+    planned = await svc.add_to_meal_plan(day, ["r59322", "01ABC", "r1"])
+    api.add_recipes_to_calendar.assert_awaited_once_with(day, ["r59322", "r1"])
+    api.add_custom_recipes_to_calendar.assert_awaited_once_with(day, ["01ABC"])
+    assert planned.id == "2026-11-05"
+
+    await svc.remove_from_meal_plan(day, "01ABC")
+    api.remove_custom_recipe_from_calendar.assert_awaited_once_with(day, "01ABC")
+    api.remove_recipe_from_calendar.assert_not_called()
+
+
+async def test_copy_recipe_defaults_to_original_servings(service):
+    service.get_recipe_details.return_value = SimpleNamespace(serving_size=4)
+    service.copy_recipe_to_custom.return_value = SimpleNamespace(
+        name="Gratin", id="01NEW", url="https://x/01NEW"
+    )
+    text = await call("copy_recipe_to_custom", recipe_id="r1")
+    service.copy_recipe_to_custom.assert_awaited_once_with("r1", 4)
+    assert "01NEW" in text
+
+
+async def test_copy_recipe_rejects_custom_id(service):
+    with pytest.raises(ToolError, match="catalogue"):
+        await call("copy_recipe_to_custom", recipe_id="01ABC")
+    service.copy_recipe_to_custom.assert_not_called()
+
+
+async def test_get_shopping_list_formats_sections(service):
+    service.get_shopping_list.return_value = SimpleNamespace(
+        recipes=[SimpleNamespace(name="Gratin", id="r1")],
+        ingredients=[
+            SimpleNamespace(id="i1", name="flour", description="200 g", is_owned=True),
+            SimpleNamespace(id="i2", name="butter", description="", is_owned=False),
+        ],
+        additional_items=[SimpleNamespace(id="a1", name="kitchen paper", is_owned=False)],
+    )
+    text = await call("get_shopping_list")
+    assert "- Gratin (ID: r1)" in text
+    assert "- [x] flour 200 g (ID: i1)" in text and "- [ ] butter (ID: i2)" in text
+    assert "Additional items:\n- [ ] kitchen paper (ID: a1)" in text
+
+
+async def test_get_shopping_list_empty(service):
+    service.get_shopping_list.return_value = SimpleNamespace(
+        recipes=[], ingredients=[], additional_items=[]
+    )
+    assert await call("get_shopping_list") == "The shopping list is empty."
+
+
+async def test_mark_shopping_list_items_reports_missing(service):
+    service.mark_shopping_list_items.return_value = ["zzz"]
+    text = await call("mark_shopping_list_items", item_ids="i1, zzz", owned=False)
+    service.mark_shopping_list_items.assert_awaited_once_with(["i1", "zzz"], False)
+    assert "Unticked 1 item(s)" in text and "zzz" in text
+
+
+async def test_collections_reject_custom_recipe_ids(service):
+    with pytest.raises(ToolError, match="catalogue"):
+        await call("add_recipes_to_collection", collection_id="c1", recipe_ids="r1, 01ABC")
+    service.add_recipes_to_collection.assert_not_called()
+
+
+async def test_create_collection_with_recipes(service):
+    recipe = SimpleNamespace(id="r1", name="Gratin", total_time=600)
+    service.create_collection.return_value = SimpleNamespace(id="c1", name="Xmas", chapters=[])
+    service.add_recipes_to_collection.return_value = SimpleNamespace(
+        id="c1", name="Xmas", chapters=[SimpleNamespace(recipes=[recipe])]
+    )
+    text = await call("create_collection", name="Xmas", recipe_ids=["r1"])
+    service.add_recipes_to_collection.assert_awaited_once_with("c1", ["r1"])
+    assert "Xmas (1 recipes) | ID: c1" in text and "Gratin (10 min)" in text
+
+
+def _service_with_api(monkeypatch):
+    svc = CookidooService(CookidooSettings(email="a@b.c", password="x"))
+    api = AsyncMock()
+    monkeypatch.setattr(svc, "client", AsyncMock(return_value=api))
+    return svc, api
+
+
+async def test_service_shopping_list_routes_recipe_kinds(monkeypatch):
+    svc, api = _service_with_api(monkeypatch)
+    await svc.add_recipes_to_shopping_list(["r1", "01ABC"])
+    api.add_ingredient_items_for_recipes.assert_awaited_once_with(["r1"])
+    api.add_ingredient_items_for_custom_recipes.assert_awaited_once_with(["01ABC"])
+    await svc.remove_recipes_from_shopping_list(["01ABC"])
+    api.remove_ingredient_items_for_custom_recipes.assert_awaited_once_with(["01ABC"])
+    api.remove_ingredient_items_for_recipes.assert_not_called()
+
+
+async def test_service_mark_items_uses_the_right_endpoint(monkeypatch):
+    from cookidoo_api.types import CookidooAdditionalItem, CookidooIngredientItem
+
+    svc, api = _service_with_api(monkeypatch)
+    api.get_shopping_list_recipes.return_value = []
+    api.get_ingredient_items.return_value = [
+        CookidooIngredientItem(id="i1", name="flour", is_owned=False, description="200 g")
+    ]
+    api.get_additional_items.return_value = [
+        CookidooAdditionalItem(id="a1", name="paper", is_owned=False)
+    ]
+    missing = await svc.mark_shopping_list_items(["i1", "a1", "nope"], True)
+    assert missing == ["nope"]
+    [ingredients] = api.edit_ingredient_items_ownership.await_args.args
+    [additional] = api.edit_additional_items_ownership.await_args.args
+    assert [(i.id, i.is_owned) for i in ingredients] == [("i1", True)]
+    assert [(i.id, i.is_owned) for i in additional] == [("a1", True)]
+
+
+async def test_service_meal_plan_to_shopping_list_dedupes(monkeypatch):
+    svc, api = _service_with_api(monkeypatch)
+    api.get_recipes_in_calendar_week.return_value = [
+        _day("2026-11-03", _planned("r1", "Gratin")),
+        _day("2026-11-04", _planned("r1", "Gratin"), _planned("01ABC", "Cookies", True)),
+    ]
+    names = await svc.add_meal_plan_to_shopping_list(date(2026, 11, 4))
+    assert names == ["Gratin", "Cookies"]
+    api.add_ingredient_items_for_recipes.assert_awaited_once_with(["r1"])
+    api.add_ingredient_items_for_custom_recipes.assert_awaited_once_with(["01ABC"])
+
+
+async def test_service_list_collections_reads_all_pages(monkeypatch):
+    svc, api = _service_with_api(monkeypatch)
+    api.count_custom_collections.return_value = (3, 2)
+    api.get_custom_collections.side_effect = lambda page: [f"c{page}"]
+    api.count_managed_collections.return_value = (0, 0)
+    cols = await svc.list_collections()
+    assert cols.custom == ["c0", "c1"] and cols.managed == []
