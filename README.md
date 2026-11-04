@@ -115,6 +115,27 @@ uv run fastmcp dev inspector fastmcp.json           # MCP Inspector
 | `remove_recipe_from_collection` | Remove a recipe from one of your collections |
 | `follow_collection` / `unfollow_collection` | Follow or unfollow a Cookidoo collection |
 
+## Cookidoo API coverage
+
+Built on [cookidoo-api](https://github.com/miaucl/cookidoo-api) **0.19.0**, the latest release
+as of November 2026. The tools cover every area of it that is useful in a chat:
+
+| Area | Covered |
+| --- | --- |
+| Catalogue search and recipe details | ✅ |
+| Custom recipes: list, read, create, update, delete, copy from catalogue | ✅ |
+| "My Week" planner: read a week, add / remove recipes | ✅ |
+| Shopping list: recipes, ingredients, free-text items, ownership, clear | ✅ |
+| Collections: own (create, delete, add / remove recipes) and Cookidoo's (follow / unfollow) | ✅ |
+
+Not exposed on purpose: user info and subscription, linked Thermomix devices and push-token
+registration (meant for mobile apps), and renaming free-text shopping items. Recipe ratings,
+favourites and cooking history are not offered by cookidoo-api at all.
+
+Catalogue and custom recipes use different endpoints for the planner and the shopping list.
+The tools take both kinds of ID mixed (`r59322` vs. `01K…`) and route each one. Collections
+only hold catalogue recipes.
+
 ## Recipe steps
 
 A step is either plain text, or an object with Thermomix settings preset in guided cooking
